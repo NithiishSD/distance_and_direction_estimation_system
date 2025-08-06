@@ -635,10 +635,3 @@ C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/wifi_provisioning/C
 C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/wifi_provisioning/CMakeFiles/install.dir
 C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/wifi_provisioning/CMakeFiles/install/local.dir
 C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/wifi_provisioning/CMakeFiles/install/strip.dir
-C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/main/CMakeFiles/__idf_main.dir
-C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/main/CMakeFiles/edit_cache.dir
-C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/main/CMakeFiles/rebuild_cache.dir
-C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/main/CMakeFiles/list_install_components.dir
-C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/main/CMakeFiles/install.dir
-C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/main/CMakeFiles/install/local.dir
-C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/main/CMakeFiles/install/strip.dir

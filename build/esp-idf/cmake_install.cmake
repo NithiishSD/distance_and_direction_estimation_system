@@ -412,8 +412,3 @@ if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   include("C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/wifi_provisioning/cmake_install.cmake")
 endif()
 
-if(NOT CMAKE_INSTALL_LOCAL_ONLY)
-  # Include the install script for the subdirectory.
-  include("C:/Users/nithi/Documents/embeddedsystemproject/build/esp-idf/main/cmake_install.cmake")
-endif()
-
