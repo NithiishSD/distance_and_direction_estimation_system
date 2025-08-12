@@ -1,131 +1,194 @@
+#include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_wifi.h"
-#include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include "driver/ledc.h"
-#include "esp_err.h"
+#include "esp_bt.h"
+#include "esp_bluedroid_hci.h"
+#include "esp_gap_ble_api.h"
 
-#define SERVO1_GPIO 19 // Servo 1: Clockwise
-#define SERVO2_GPIO 18 // Servo 2: Anticlockwise
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT BIT1
-static const char *TAG = "WiFiScanner";
-// static const char *TAG = "WiFiConnect";
-static EventGroupHandle_t s_wifi_event_group;
-static int s_retry_num = 0;
-#define MAXIMUM_RETRY 5
-wifi_scan_config_t scan_config = {
-    .ssid = 0,
-    .bssid = 0,
-    .channel = 0,
-    .show_hidden = true};
+// Tag for logging
+static const char *TAG = "DEVICE_SCAN";
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+// Define structures for storing detected devices
+#define MAX_WIFI_DEVICES 20
+#define MAX_BT_DEVICES 20
+
+typedef struct
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    char ssid[33]; // SSID max length is 32 + null terminator
+    uint8_t mac[6];
+    uint8_t channel;
+    int32_t rssi;
+} wifi_device_t;
+
+typedef struct
+{
+    uint8_t mac[6];
+    char name[32];
+    int32_t rssi;
+} bt_device_t;
+
+// Global arrays to store detected devices
+wifi_device_t wifi_devices[MAX_WIFI_DEVICES];
+bt_device_t bt_devices[MAX_BT_DEVICES];
+int wifi_device_count = 0;
+int bt_device_count = 0;
+
+// Baseline noise levels (average RSSI from non-target devices)
+float wifi_baseline_noise = 0.0;
+float bt_baseline_noise = 0.0;
+
+// BLE GAP callback for scan results
+static void ble_gap_callback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+{
+    if (event == ESP_GAP_BLE_SCAN_RESULT_EVT)
     {
-        esp_wifi_connect();
-    }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
-    {
-        if (s_retry_num < MAXIMUM_RETRY)
+        esp_ble_gap_cb_param_t *scan_result = param;
+        if (scan_result->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_RES_EVT && bt_device_count < MAX_BT_DEVICES)
         {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "Retrying to connect to the AP");
+            bt_device_t device;
+            memcpy(device.mac, scan_result->scan_rst.bda, 6);
+            // Get device name if available
+            device.name[0] = '\0';
+            if (scan_result->scan_rst.adv_data_len > 0)
+            {
+                uint8_t *adv_data = scan_result->scan_rst.adv_data;
+                uint8_t len = 0;
+                uint8_t *data = esp_ble_resolve_adv_data(adv_data, ESP_BLE_AD_TYPE_NAME_CMPL, &len);
+                if (data && len < 32)
+                {
+                    memcpy(device.name, data, len);
+                    device.name[len] = '\0';
+                }
+            }
+            device.rssi = scan_result->scan_rst.rssi;
+            bt_devices[bt_device_count++] = device;
+
+            // Log device details
+            ESP_LOGI(TAG, "BT Device: MAC=%02x:%02x:%02x:%02x:%02x:%02x, Name=%s, RSSI=%d",
+                     device.mac[0], device.mac[1], device.mac[2], device.mac[3], device.mac[4], device.mac[5],
+                     device.name, device.rssi);
         }
-        else
+        else if (scan_result->scan_rst.search_evt == ESP_GAP_SEARCH_INQ_CMPL_EVT)
         {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            // Scan complete, calculate baseline noise
+            int32_t total_rssi = 0;
+            for (int i = 0; i < bt_device_count; i++)
+            {
+                total_rssi += bt_devices[i].rssi;
+            }
+            bt_baseline_noise = (bt_device_count > 0) ? (float)total_rssi / bt_device_count : 0.0;
+            ESP_LOGI(TAG, "BT Baseline Noise (Avg RSSI): %.2f dBm", bt_baseline_noise);
         }
-        ESP_LOGI(TAG, "Connect to the AP failed");
-    }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
-    {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-void connect_to_ap(const char *ssid, const char *password)
+// Initialize NVS (required for Wi-Fi and Bluetooth)
+static void initialize_nvs(void)
 {
-    s_wifi_event_group = xEventGroupCreate();
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+}
 
+// Initialize Wi-Fi
+static void initialize_wifi(void)
+{
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
-
-    wifi_config_t wifi_config = {0};
-    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
-    strncpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
-
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    wifi_config.sta.pmf_cfg.capable = true;
-    wifi_config.sta.pmf_cfg.required = false;
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "Wi-Fi initialization complete.");
-
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-
-    if (bits & WIFI_CONNECTED_BIT)
-    {
-        ESP_LOGI(TAG, "Connected to SSID:%s", ssid);
-    }
-    else if (bits & WIFI_FAIL_BIT)
-    {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s", ssid);
-    }
-    else
-    {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
-    }
 }
 
-void wifi_scan_task(void *pvParameters)
+// Initialize Bluetooth (BLE only)
+static void initialize_ble(void)
 {
-    while (1)
-    {
-
-        ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_config, true));
-
-        uint16_t ap_num = 0;
-        esp_wifi_scan_get_ap_num(&ap_num);
-        wifi_ap_record_t ap_records[ap_num];
-        ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_num, ap_records));
-
-        ESP_LOGI(TAG, "Found %d access points:", ap_num);
-        for (int i = 0; i < ap_num; i++)
-        {
-            ESP_LOGI(TAG, "SSID: %s, RSSI: %d, Channel: %d",
-                     ap_records[i].ssid,
-                     ap_records[i].rssi,
-                     ap_records[i].primary);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(2000)); // wait 2 seconds
-    }
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT)); // Release Classic BT memory
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
+    ESP_ERROR_CHECK(esp_bluedroid_init());
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
+    ESP_ERROR_CHECK(esp_ble_gap_register_callback(ble_gap_callback));
 }
 
-// Convert angle (0–180) to PWM duty cycle (for 16-bit resolution and 50Hz)
-uint32_t angle_to_duty(int angle)
+// Perform Wi-Fi scan
+static void wifi_scan(void)
 {
-    int pulse_width_us = 500 + (angle * 2000 / 180); // 0.5ms to 2.5ms pulse width
-    return (pulse_width_us * 65535) / 20000;         // Convert to 16-bit duty for 20ms period (50Hz)
+    wifi_device_count = 0;
+    wifi_scan_config_t scan_config = {
+        .ssid = NULL,
+        .bssid = NULL,
+        .channel = 0, // Scan all channels
+        .show_hidden = true,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active = {
+            .min = 120,
+            .max = 120}};
+
+    ESP_LOGI(TAG, "Starting Wi-Fi scan...");
+    ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_config, true));
+
+    uint16_t ap_count = 0;
+    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
+    wifi_ap_record_t *ap_list = (wifi_ap_record_t *)malloc(ap_count * sizeof(wifi_ap_record_t));
+    if (ap_list == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to allocate memory for Wi-Fi scan results");
+        return;
+    }
+
+    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_list));
+    int32_t total_rssi = 0;
+
+    for (int i = 0; i < ap_count && wifi_device_count < MAX_WIFI_DEVICES; i++)
+    {
+        wifi_device_t device;
+        strncpy(device.ssid, (char *)ap_list[i].ssid, 33);
+        memcpy(device.mac, ap_list[i].bssid, 6);
+        device.channel = ap_list[i].primary;
+        device.rssi = ap_list[i].rssi;
+        wifi_devices[wifi_device_count++] = device;
+        total_rssi += device.rssi;
+
+        // Log device details
+        ESP_LOGI(TAG, "WiFi Device: SSID=%s, MAC=%02x:%02x:%02x:%02x:%02x:%02x, Channel=%d, RSSI=%d",
+                 device.ssid, device.mac[0], device.mac[1], device.mac[2], device.mac[3], device.mac[4], device.mac[5],
+                 device.channel, device.rssi);
+    }
+
+    // Calculate baseline noise
+    wifi_baseline_noise = (wifi_device_count > 0) ? (float)total_rssi / wifi_device_count : 0.0;
+    ESP_LOGI(TAG, "Wi-Fi Baseline Noise (Avg RSSI): %.2f dBm", wifi_baseline_noise);
+
+    free(ap_list);
+}
+
+// Perform BLE scan
+static void ble_scan(void)
+{
+    bt_device_count = 0;
+    ESP_LOGI(TAG, "Starting BLE scan...");
+    esp_ble_scan_params_t ble_scan_params = {
+        .scan_type = BLE_SCAN_TYPE_ACTIVE,
+        .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
+        .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
+        .scan_interval = 0x50, // 80 ms
+        .scan_window = 0x30,   // 30 ms
+        .scan_duplicate = BLE_SCAN_DUPLICATE_DISABLE};
+    ESP_ERROR_CHECK(esp_ble_gap_set_scan_params(&ble_scan_params));
+    ESP_ERROR_CHECK(esp_ble_gap_start_scanning(5)); // Scan for 5 seconds
 }
 
 void init_servos()
@@ -186,22 +249,35 @@ void sweep_servos_once()
     // Optional: pause before returning
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
-
 void app_main(void)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-    // Initialize servos once at startup
-    init_servos();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    // Call the sweep function once
-    sweep_servos_once();
+    // Initialize NVS
+    initialize_nvs();
 
-    // xTaskCreate(&wifi_scan_task, "wifi_scan_task", 4096, NULL, 5, NULL);
-    //  connect_to_ap("Varunesh", "varunbroo");
+    // Initialize Wi-Fi and perform scan
+    initialize_wifi();
+    wifi_scan();
+
+    // Stop Wi-Fi to free resources for BLE
+    ESP_ERROR_CHECK(esp_wifi_stop());
+
+    // Initialize BLE and perform scan
+    initialize_ble();
+    ble_scan();
+
+    // Note: BLE scan runs asynchronously; results are handled in ble_gap_callback
+    // Wait for BLE scan to complete (5 seconds + margin)
+    vTaskDelay(pdMS_TO_TICKS(6000));
+
+    // Stop BLE to free resources
+    ESP_ERROR_CHECK(esp_ble_gap_stop_scanning());
+    ESP_ERROR_CHECK(esp_bluedroid_disable());
+    ESP_ERROR_CHECK(esp_bluedroid_deinit());
+    ESP_ERROR_CHECK(esp_bt_controller_disable());
+    ESP_ERROR_CHECK(esp_bt_controller_deinit());
+
+    ESP_LOGI(TAG, "Scan complete. Wi-Fi devices: %d, BLE devices: %d", wifi_device_count, bt_device_count);
+    ESP_LOGI(TAG, "Devices saved for further use. Use wifi_devices and bt_devices arrays for target selection.");
 }
+// xTaskCreate(&wifi_scan_task, "wifi_scan_task", 4096, NULL, 5, NULL);
+//  connect_to_ap("Varunesh", "varunbroo");
